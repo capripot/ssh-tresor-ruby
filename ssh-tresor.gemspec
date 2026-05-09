@@ -25,5 +25,7 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "rspec", "~> 3.13"
   spec.add_development_dependency "yard", "~> 0.9"
 
+  spec.metadata["documentation_uri"] = "https://capripot.github.io/ssh-tresor-ruby/"
+  spec.metadata["source_code_uri"] = "https://github.com/capripot/ssh-tresor-ruby"
   spec.metadata["rubygems_mfa_required"] = "true"
 end

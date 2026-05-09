@@ -1,5 +1,7 @@
 # ssh-tresor-ruby
 
+[![API docs](https://img.shields.io/badge/docs-GitHub%20Pages-blue)](https://capripot.github.io/ssh-tresor-ruby/)
+
 `ssh-tresor` provides SSH-agent-mediated encryption at rest: secrets are
 stored encrypted on disk and can be decrypted only while a matching SSH agent
 signing capability is available.
@@ -17,6 +19,8 @@ challenge for that slot.
 
 For a detailed cryptographic analysis of the construction, see the
 [ssh-tresor-ruby white paper](white_paper/ssh_tresor_white_paper.pdf).
+Generated API documentation is published at
+[capripot.github.io/ssh-tresor-ruby](https://capripot.github.io/ssh-tresor-ruby/).
 
 It is freely inspired by the [`ssh-tresor`][1] project but doesn't depend
 on it.
