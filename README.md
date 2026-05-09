@@ -15,6 +15,9 @@ key fingerprints are stored in the tresor metadata so the right slot can be
 found, but the file cannot be unlocked unless the agent can sign the stored
 challenge for that slot.
 
+For a detailed cryptographic analysis of the construction, see the
+[ssh-tresor-ruby white paper](white_paper/ssh_tresor_white_paper.pdf).
+
 It is freely inspired by the [`ssh-tresor`][1] project but doesn't depend
 on it.
 

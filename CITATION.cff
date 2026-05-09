@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use ssh-tresor-ruby, please cite it using the metadata below."
+type: software
+title: "ssh-tresor-ruby"
+version: "0.1.0"
+date-released: "2026-05-09"
+license: "MIT"
+abstract: "Ruby implementation of ssh-tresor using live SSH-agent signatures, HKDF-SHA256, and AES-256-GCM to provide SSH-agent-mediated encryption at rest for secrets."
+authors:
+  - given-names: "Ronan"
+    family-names: "Potage"
+    affiliation: "Cisco Meraki"
+repository-code: "https://github.com/capripot/ssh-tresor-ruby"
+url: "https://github.com/capripot/ssh-tresor-ruby"
+keywords:
+  - "ssh-agent"
+  - "encryption-at-rest"
+  - "ruby"
+  - "cryptography"
+  - "aes-gcm"
+  - "hkdf"

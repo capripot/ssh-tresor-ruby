@@ -1,0 +1,696 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{enumitem}
+
+\geometry{margin=1in}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!55!black,
+  citecolor=blue!55!black,
+  urlcolor=blue!55!black,
+  pdftitle={ssh-tresor-ruby: Encrypting Files with SSH Agents -- An Analysis of SSH-Agent-Gated Encryption at Rest},
+  pdfauthor={Ronan Potage}
+}
+
+\definecolor{codebg}{RGB}{248,248,248}
+\definecolor{codeframe}{RGB}{220,220,220}
+\definecolor{commentgreen}{RGB}{0,105,70}
+
+\lstdefinestyle{rubycode}{
+  language=Ruby,
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  framerule=0.4pt,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{commentgreen},
+  stringstyle=\color{red!45!black},
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=8pt,
+  xleftmargin=1.8em,
+  framexleftmargin=1.4em
+}
+
+\lstdefinestyle{textcode}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\newtheorem{assumption}{Assumption}
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}
+\newtheorem{theorem}{Theorem}
+
+\newcommand{\Project}{\texttt{ssh-tresor-ruby}}
+\newcommand{\Tresor}{\texttt{SSHTRESR}}
+\newcommand{\HKDF}{\operatorname{HKDF}}
+\newcommand{\Enc}{\operatorname{Enc}}
+\newcommand{\Dec}{\operatorname{Dec}}
+\newcommand{\Sign}{\operatorname{Sign}}
+\newcommand{\Adv}{\mathcal{A}}
+\newcommand{\bitstrings}{\{0,1\}^*}
+
+\title{\Project{}: Encrypting Files with SSH Agents\\[0.4em]\large An Analysis of SSH-Agent-Gated Encryption at Rest}
+\author{Ronan Potage\\Staff Software Engineer, Cisco Meraki}
+\date{May 9, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\Project{} encrypts files by using an active SSH agent as a private-key signing oracle. It does not perform public-key encryption with the SSH public key. Instead, it creates a fresh random master key, encrypts the file with AES-256-GCM, asks the SSH agent to sign random per-key challenges, derives wrapping keys from those signatures using HKDF-SHA256, and stores AES-256-GCM encrypted copies of the master key in key slots. A stored file is therefore encrypted at rest; the distinctive access property is better called \emph{SSH-agent-mediated encryption at rest} or \emph{SSH-agent-gated decryption}. The same construction works with a local SSH agent or a forwarded SSH agent: decryption requires that a matching private-key signing operation be reachable through the active agent socket.
+
+This paper gives a correctness proof and a conditional confidentiality proof for the implemented construction. The proof applies to SSH key algorithms whose agent signatures are stable byte-for-byte for the stored challenge, such as Ed25519 and RSA/SHA2 in the tested OpenSSH environment. The current implementation should not be described as working for all SSH key types: randomized signature schemes, notably ECDSA as exercised by OpenSSH here, do not re-derive the same slot key and therefore do not satisfy the correctness theorem.
+\end{abstract}
+
+\section{Executive summary}
+
+\Project{} implements envelope encryption gated by an SSH agent. The encrypted file contains:
+
+\begin{itemize}[leftmargin=*]
+  \item one AES-256-GCM ciphertext of the plaintext under a fresh 256-bit master key;
+  \item one or more key slots, each containing a random challenge and an AES-256-GCM encrypted copy of the master key;
+  \item the SHA-256 fingerprint of each SSH public key, so the decryptor can select the matching agent key.
+\end{itemize}
+
+The workflow is correctly described as \emph{encryption at rest} for the file stored on disk, with an \emph{SSH-agent-gated} decryption condition:
+
+\begin{quote}
+The file remains encrypted at rest. Decryption requires an active SSH agent capable of producing a private-key signature for a stored challenge. In local use, that usually means the key has been unlocked and loaded into the agent with \texttt{ssh-add}. In remote use, that means the forwarded agent socket is still reachable from the remote host.
+\end{quote}
+
+That wording is more precise than saying "the SSH key is present." The public key and its fingerprint are not secret and are stored in, or derivable from, the file metadata. What must be present is the private-key operation exposed by the SSH agent.
+
+\section{Project behavior and terminology}
+
+\subsection{The operational flows}
+
+The construction supports two common flows.
+
+\paragraph{Local agent flow.}
+A user has a passphrase-protected SSH key on disk. The private key is not directly usable until the user runs \texttt{ssh-add} and provides the passphrase. Once the key is loaded into the local SSH agent, \Project{} can ask that agent to sign slot challenges and can encrypt or decrypt files. If the key is removed from the agent, the agent is stopped, or \texttt{SSH\_AUTH\_SOCK} no longer points to that agent, the stored \Tresor{} blob remains encrypted and cannot be decrypted from the public file metadata alone.
+
+\paragraph{Forwarded-agent remote flow.}
+The motivating remote flow is:
+
+\begin{enumerate}[leftmargin=*]
+  \item A user logs in to a remote host with SSH agent forwarding, for example \texttt{ssh -A remote}.
+  \item The remote shell receives an \texttt{SSH\_AUTH\_SOCK} environment variable pointing to a forwarded agent socket.
+  \item \Project{} running on the remote host asks that forwarded agent to sign random challenges.
+  \item \Project{} derives local wrapping keys from those signatures, encrypts the file, and writes a \Tresor{} blob on the remote disk.
+  \item The user logs out. The forwarded socket is gone. The remote host retains only the encrypted blob.
+\end{enumerate}
+
+Both flows are forms of encryption at rest because the stored file is ciphertext. The special property is not merely "at rest" storage encryption, but \emph{agent-gated decryptability}: access to the plaintext is coupled to the active availability of a matching SSH-agent signing capability, whether that agent is local or forwarded.
+
+\subsection{What the construction is, and is not}
+
+\Project{} is:
+
+\begin{itemize}[leftmargin=*]
+  \item an envelope encryption scheme;
+  \item a symmetric authenticated encryption scheme for file contents;
+  \item an SSH-agent-mediated key wrapping scheme for the data master key;
+  \item a way to make a stored file unreadable whenever the matching SSH-agent signing capability is unavailable, under the threat model in Section~\ref{sec:threat-model}.
+\end{itemize}
+
+\Project{} is not:
+
+\begin{itemize}[leftmargin=*]
+  \item public-key encryption using the SSH public key;
+  \item a replacement for full-disk encryption;
+  \item protection from a malicious machine while encryption or decryption is actively running;
+  \item protection if an attacker records the slot signature, master key, plaintext, or process memory during the active session.
+\end{itemize}
+
+\section{Implementation overview}
+
+The repository contains the core construction in four Ruby modules:
+
+\begin{longtable}{>{\ttfamily}p{0.33\linewidth}p{0.58\linewidth}}
+\toprule
+File & Cryptographic role \\
+\midrule
+\endhead
+lib/ssh\_tresor/crypto.rb & Random generation, HKDF-SHA256, AES-256-GCM encryption and decryption. \\
+lib/ssh\_tresor/agent.rb & SSH agent connection, identity listing, public-key fingerprinting, signing request construction. \\
+lib/ssh\_tresor/tresor.rb & Envelope encryption orchestration: create slots, recover the master key, encrypt and decrypt payloads. \\
+lib/ssh\_tresor/format.rb & Binary and armored \Tresor{} v3 file format. \\
+\bottomrule
+\end{longtable}
+
+The project uses Ruby's standard and bundled libraries:
+
+\begin{itemize}[leftmargin=*]
+  \item \texttt{SecureRandom.random\_bytes} for 32-byte challenges, 32-byte master keys, and 12-byte GCM nonces;
+  \item \texttt{OpenSSL::KDF.hkdf} for HKDF-SHA256, corresponding to RFC 5869~\cite{rfc5869};
+  \item \texttt{OpenSSL::Cipher.new("aes-256-gcm")} for AES-256-GCM authenticated encryption, whose mode is specified by NIST SP 800-38D~\cite{nist-gcm};
+  \item \texttt{UNIXSocket} and \texttt{SSH\_AUTH\_SOCK} for the SSH agent protocol, which is a de-facto protocol currently documented as an IETF Internet-Draft~\cite{ssh-agent-draft};
+  \item \texttt{Digest::SHA256} to compute OpenSSH-style SHA-256 public-key fingerprints.
+\end{itemize}
+
+\section{The implemented file format}
+
+\path{lib/ssh_tresor/format.rb} defines \Tresor{} v3:
+
+\begin{lstlisting}[style=textcode]
+Header:  SSHTRESR (8) + version (1) + slot_count (1)
+Slot:    fingerprint (32) + challenge (32) + nonce (12) + encrypted_key (48)
+Data:    nonce (12) + ciphertext including 16-byte AES-GCM auth tag
+\end{lstlisting}
+
+The code constants are:
+
+\begin{lstlisting}[style=rubycode,caption={File-format constants from lib/ssh\_tresor/format.rb.}]
+MAGIC = "SSHTRESR".b
+VERSION = 0x03
+FINGERPRINT_SIZE = 32
+CHALLENGE_SIZE = 32
+NONCE_SIZE = 12
+AUTH_TAG_SIZE = 16
+MASTER_KEY_SIZE = 32
+ENCRYPTED_KEY_SIZE = MASTER_KEY_SIZE + AUTH_TAG_SIZE
+SLOT_SIZE = FINGERPRINT_SIZE + CHALLENGE_SIZE + NONCE_SIZE + ENCRYPTED_KEY_SIZE
+HEADER_SIZE = 10
+\end{lstlisting}
+
+For each slot, the stored fields have the following security meaning:
+
+\begin{longtable}{p{0.23\linewidth}p{0.15\linewidth}p{0.51\linewidth}}
+\toprule
+Field & Secret? & Meaning \\
+\midrule
+\endhead
+\texttt{fingerprint} & No & \texttt{SHA256} digest of the SSH public key blob. It selects the matching agent key. \\
+\texttt{challenge} & No & 32-byte random value that the agent must sign to recreate the slot key. \\
+\texttt{nonce} & No & 12-byte AES-GCM nonce for encrypting the master key in that slot. \\
+\texttt{encrypted\_key} & Yes, as ciphertext & 32-byte master key encrypted with AES-GCM plus a 16-byte authentication tag. \\
+\bottomrule
+\end{longtable}
+
+The data section stores a separate 12-byte GCM nonce and the AES-GCM ciphertext of the plaintext under the master key.
+
+\section{Cryptographic construction}
+
+\subsection{Notation}
+
+Let:
+
+\begin{itemize}[leftmargin=*]
+  \item $P \in \bitstrings$ be the plaintext file.
+  \item $K_M \leftarrow \{0,1\}^{256}$ be a randomly generated master key.
+  \item $n_D \leftarrow \{0,1\}^{96}$ be the data AES-GCM nonce.
+  \item $C_D = \Enc_{\mathrm{GCM}}(K_M,n_D,P)$ be the data ciphertext plus authentication tag.
+  \item $(pk_i,sk_i)$ be the SSH public/private key pair represented by an agent key.
+  \item $F_i = \mathrm{SHA256}(\mathrm{ssh\_public\_key\_blob}_i)$ be the stored 32-byte fingerprint.
+  \item $r_i \leftarrow \{0,1\}^{256}$ be a random challenge for slot $i$.
+  \item $\sigma_i = \Sign_{sk_i}(r_i)$ be the raw signature bytes returned by the SSH agent.
+  \item $K_i$ is the 32-byte slot wrapping key:
+  \[
+    K_i = \HKDF_{\mathrm{SHA256}}(\sigma_i,\text{salt},\text{info},32),
+  \]
+  where \texttt{salt} is \texttt{"ssh-tresor-v3"} and \texttt{info} is \texttt{"slot-key-derivation"}.
+  \item $n_i \leftarrow \{0,1\}^{96}$ be the slot AES-GCM nonce.
+  \item $E_i = \Enc_{\mathrm{GCM}}(K_i,n_i,K_M)$ be the encrypted master key plus authentication tag.
+\end{itemize}
+
+The file stores:
+
+\[
+  B = \left(\texttt{SSHTRESR}, 3, \ell,
+  \{(F_i,r_i,n_i,E_i)\}_{i=1}^{\ell}, n_D, C_D\right).
+\]
+
+\subsection{Encryption algorithm}
+
+For selected agent keys $pk_1,\ldots,pk_{\ell}$:
+
+\begin{enumerate}[leftmargin=*]
+  \item Generate $K_M$ with \texttt{SecureRandom.random\_bytes(32)}.
+  \item For each selected key, generate a random challenge $r_i$.
+  \item Ask the SSH agent to compute $\sigma_i=\Sign_{sk_i}(r_i)$.
+  \item Derive $K_i=\HKDF_{\mathrm{SHA256}}(\sigma_i,\texttt{"ssh-tresor-v3"},\texttt{"slot-key-derivation"},32)$.
+  \item Encrypt $K_M$ as $E_i=\Enc_{\mathrm{GCM}}(K_i,n_i,K_M)$.
+  \item Encrypt the file as $C_D=\Enc_{\mathrm{GCM}}(K_M,n_D,P)$.
+  \item Serialize the slots and data ciphertext as \Tresor{} v3.
+\end{enumerate}
+
+This is implemented by \texttt{encrypt\_with\_keys} and \texttt{create\_slot}:
+
+\begin{lstlisting}[style=rubycode,caption={Envelope encryption and slot creation from lib/ssh\_tresor/tresor.rb.}]
+def encrypt_with_keys(agent, keys, plaintext)
+  master_key = Crypto.random_master_key
+  slots = keys.map { |key| create_slot(agent, key, master_key) }
+  data_nonce = Crypto.random_nonce
+  ciphertext = Crypto.encrypt(master_key, data_nonce, plaintext)
+
+  TresorBlob.new(slots: slots, data_nonce: data_nonce, ciphertext: ciphertext)
+end
+
+def create_slot(agent, key, master_key)
+  challenge = Crypto.random_challenge
+  signature = agent.sign(key, challenge)
+  slot_key = Crypto.derive_key(signature)
+  nonce = Crypto.random_nonce
+  encrypted_key = Crypto.encrypt(slot_key, nonce, master_key)
+
+  Slot.new(
+    fingerprint: key.fingerprint_bytes,
+    challenge: challenge,
+    nonce: nonce,
+    encrypted_key: encrypted_key
+  )
+end
+\end{lstlisting}
+
+\subsection{Decryption algorithm}
+
+Given a \Tresor{} blob and an active SSH agent:
+
+\begin{enumerate}[leftmargin=*]
+  \item List the public keys currently available through the agent.
+  \item For each agent key, find a slot whose stored fingerprint equals \texttt{SHA256(public\_key\_blob)}.
+  \item Ask the agent to sign the stored challenge $r_i$, producing $\sigma_i'$.
+  \item Derive $K_i'=\HKDF_{\mathrm{SHA256}}(\sigma_i',\texttt{"ssh-tresor-v3"},\texttt{"slot-key-derivation"},32)$.
+  \item Decrypt $E_i$ under $K_i'$ to recover $K_M$.
+  \item Decrypt $C_D$ under $K_M$ to recover $P$.
+\end{enumerate}
+
+The implementation is direct:
+
+\begin{lstlisting}[style=rubycode,caption={Slot-based decryption from lib/ssh\_tresor/tresor.rb.}]
+def decrypt_with_slot(agent, key, slot, blob)
+  signature = agent.sign(key, slot.challenge)
+  slot_key = Crypto.derive_key(signature)
+  master_key = Crypto.decrypt(slot_key, slot.nonce, slot.encrypted_key)
+  Crypto.decrypt(master_key, blob.data_nonce, blob.ciphertext)
+end
+\end{lstlisting}
+
+\section{How the SSH agent is used}
+
+\Project{} connects to the active agent through \texttt{SSH\_AUTH\_SOCK}:
+
+\begin{lstlisting}[style=rubycode,caption={Agent socket connection from lib/ssh\_tresor/agent.rb.}]
+def self.connect
+  socket_path = ENV["SSH_AUTH_SOCK"]
+  raise AgentError, "SSH agent not available\nHint: Is SSH_AUTH_SOCK set? Try running: eval $(ssh-agent) && ssh-add" if socket_path.nil? || socket_path.empty?
+
+  new(UNIXSocket.new(socket_path))
+rescue SystemCallError => e
+  raise AgentError, "Failed to connect to SSH agent: #{e.message}"
+end
+\end{lstlisting}
+
+The socket named by \texttt{SSH\_AUTH\_SOCK} may be a local agent socket or an agent-forwarding socket created by \texttt{ssh -A}. \Project{} does not need to distinguish those cases. It only requires that the socket expose an agent identity capable of signing the stored slot challenge. For a passphrase-protected private key, this usually means the user has already unlocked and loaded the key into the agent with \texttt{ssh-add}; the encrypted private-key file on disk is not itself used by \Project{}.
+
+It requests signatures with the SSH agent signing operation:
+
+\begin{lstlisting}[style=rubycode,caption={Signing request from lib/ssh\_tresor/agent.rb.}]
+def sign(key, data)
+  flags = key.ssh_type == "ssh-rsa" ? SSH_AGENT_SIGN_REQUEST_RSA_SHA2_256 : 0
+  payload = SSHEncoding.byte(SSH_AGENTC_SIGN_REQUEST) +
+            SSHEncoding.string(key.blob) +
+            SSHEncoding.string(data) +
+            SSHEncoding.uint32(flags)
+
+  response = request(payload)
+  reader = SSHEncoding::Reader.new(response)
+  type = reader.byte
+  raise AgentError, "SSH agent refused signing request" if type == SSH_AGENT_FAILURE
+  raise AgentError, "Unexpected SSH agent response type #{type}" unless type == SSH_AGENT_SIGN_RESPONSE
+
+  signature_blob = reader.string
+  signature_reader = SSHEncoding::Reader.new(signature_blob)
+  signature_reader.string
+  signature_reader.string
+end
+\end{lstlisting}
+
+The private key is never read by this code. The code sends a public key blob and data to be signed, then receives signature bytes. For RSA keys, it sets the OpenSSH flag requesting RSA/SHA-256 signatures, aligning the implementation with the modern RSA/SHA2 SSH algorithms standardized in RFC 8332~\cite{rfc8332}.
+
+\section{AES-GCM and HKDF implementation}
+
+The cryptographic primitives are wrapped in \path{lib/ssh_tresor/crypto.rb}:
+
+\begin{lstlisting}[style=rubycode,caption={Key derivation and AES-GCM from lib/ssh\_tresor/crypto.rb.}]
+def derive_key(signature)
+  OpenSSL::KDF.hkdf(
+    signature,
+    salt: "ssh-tresor-v3",
+    info: "slot-key-derivation",
+    length: 32,
+    hash: "SHA256"
+  )
+end
+
+def encrypt(key, nonce, plaintext)
+  cipher = OpenSSL::Cipher.new("aes-256-gcm")
+  cipher.encrypt
+  cipher.key = key
+  cipher.iv = nonce
+  cipher.auth_data = "".b
+
+  ciphertext = cipher.update(plaintext.b) + cipher.final
+  ciphertext + cipher.auth_tag
+rescue OpenSSL::Cipher::CipherError => e
+  raise Error, "Encryption failed: AES-GCM encryption failed: #{e.message}"
+end
+\end{lstlisting}
+
+The corresponding decrypt function splits the final 16 bytes as the GCM authentication tag, sets \texttt{cipher.auth\_tag}, and raises \texttt{DecryptionError} if OpenSSL rejects the tag. Therefore an incorrect slot key, an incorrect master key, or a corrupted ciphertext does not produce unauthenticated plaintext.
+
+\section{Threat model}
+\label{sec:threat-model}
+
+The security claim is intentionally narrow and operational:
+
+\begin{quote}
+After the matching SSH-agent signing capability is no longer reachable, an attacker who obtains only the \Tresor{} file cannot recover the plaintext, except with negligible probability, unless they also obtain a matching private-key signing capability or recorded key material from the active session.
+\end{quote}
+
+The claim assumes:
+
+\begin{assumption}[Cryptographic random generation]
+\texttt{SecureRandom.random\_bytes} returns unpredictable bytes for challenges, master keys, and nonces.
+\end{assumption}
+
+\begin{assumption}[AES-GCM security]
+AES-256-GCM is confidential and ciphertext-authentic for messages encrypted under a key with non-repeated nonces, as specified in NIST SP 800-38D~\cite{nist-gcm}.
+\end{assumption}
+
+\begin{assumption}[HKDF security]
+HKDF-SHA256 maps the SSH signature bytes to a pseudorandom 32-byte key for attackers who do not know, cannot compute, and did not record those signature bytes. This is the normal KDF role described by RFC 5869~\cite{rfc5869}.
+\end{assumption}
+
+\begin{assumption}[Agent signature capability]
+For supported key types, the SSH agent can reproduce the same signature bytes for the same stored challenge, and an attacker without the private key or agent oracle cannot compute those bytes.
+\end{assumption}
+
+\begin{assumption}[Session isolation]
+The attacker did not compromise the process performing encryption or decryption, did not alter the \Project{} binary being run, did not read process memory, and did not record the agent signature, slot key, master key, or plaintext while the agent was reachable.
+\end{assumption}
+
+\begin{assumption}[Agent unreachability]
+After the access window ends, the attacker cannot access an SSH agent containing the matching key and cannot cause such an agent to sign the stored challenge. In local use, this can mean the key has not been loaded with \texttt{ssh-add}, has been removed from the agent, or the agent has stopped. In remote use, this can mean the SSH session has closed and the forwarded socket is gone.
+\end{assumption}
+
+These assumptions are exactly the boundary of the user story. If the machine running \Project{} is malicious during encryption or decryption, it can log the plaintext or the signature returned by the agent. No file encryption tool can protect data from a machine that is currently handling the plaintext and is allowed to run modified code.
+
+\section{Correctness proof}
+
+\begin{definition}[Supported key for this construction]
+An SSH agent key is supported by this construction if, for a fixed challenge $r$, the agent returns the same signature bytes $\sigma$ during encryption and later decryption, and those bytes verify as a signature under the corresponding public key.
+\end{definition}
+
+\begin{lemma}[Slot recovery]
+For a supported key $i$, decryption of slot $i$ recovers the exact master key $K_M$ generated during encryption.
+\end{lemma}
+
+\begin{proof}
+During encryption, the slot challenge is $r_i$ and the agent returns $\sigma_i=\Sign_{sk_i}(r_i)$. The implementation derives:
+\[
+K_i = \HKDF_{\mathrm{SHA256}}(\sigma_i,\texttt{"ssh-tresor-v3"},\texttt{"slot-key-derivation"},32).
+\]
+It then stores:
+\[
+E_i = \Enc_{\mathrm{GCM}}(K_i,n_i,K_M).
+\]
+During decryption, the stored challenge $r_i$ is sent to the same agent key. Because the key is supported, the agent returns the same bytes $\sigma_i'=\sigma_i$. HKDF is deterministic, so $K_i'=K_i$. AES-GCM decryption under the same key and nonce accepts the authentication tag and returns the original 32-byte plaintext of the slot, namely $K_M$.
+\end{proof}
+
+\begin{theorem}[End-to-end correctness]
+For any plaintext $P$ encrypted for at least one supported SSH agent key that is later available in the agent, \Project{} decrypts the \Tresor{} blob to exactly $P$.
+\end{theorem}
+
+\begin{proof}
+By Lemma 1, the matching slot recovers the same master key $K_M$ generated during encryption. The data ciphertext was computed as $C_D=\Enc_{\mathrm{GCM}}(K_M,n_D,P)$. AES-GCM correctness says that decrypting $C_D$ with the same $K_M$ and $n_D$ returns $P$ and accepts the tag. This is exactly the code path in \texttt{decrypt\_with\_slot}.
+\end{proof}
+
+\section{Confidentiality proof}
+
+\begin{theorem}[Post-agent unreadability]
+Under the assumptions in Section~\ref{sec:threat-model}, after the matching SSH-agent signing capability is unavailable, the \Tresor{} file is computationally unreadable to an attacker who possesses only the stored blob.
+\end{theorem}
+
+\begin{proof}
+The stored blob exposes $F_i$, $r_i$, $n_i$, $E_i$, $n_D$, and $C_D$. It does not store $\sigma_i$, $K_i$, $K_M$, or $P$.
+
+To decrypt the file, an attacker must recover $P$ from $C_D$. By AES-GCM confidentiality, this requires the master key $K_M$ except with negligible probability. The only stored copies of $K_M$ are the slot ciphertexts $E_i$. By AES-GCM confidentiality for each slot, recovering $K_M$ from $E_i$ requires the corresponding slot key $K_i$ except with negligible probability.
+
+For each slot, $K_i$ is the HKDF-SHA256 output derived from $\sigma_i=\Sign_{sk_i}(r_i)$. The challenge $r_i$ is public, but by Assumption 4 an attacker without the private key or an agent oracle cannot compute the signature bytes $\sigma_i$. By Assumption 3, without $\sigma_i$ the HKDF output is computationally indistinguishable from an unknown 32-byte key. By Assumption 6, after the access window ends the attacker has no matching signing oracle. Therefore the attacker cannot recover any slot key $K_i$ except with negligible probability.
+
+Since the attacker cannot recover any $K_i$, they cannot recover $K_M$ from any slot. Since they cannot recover $K_M$, they cannot recover $P$ from the data ciphertext. Thus the file is unreadable after the active SSH agent capability disappears, except with negligible probability under the stated assumptions.
+\end{proof}
+
+\subsection{Hybrid view}
+
+The same argument can be expressed as a standard sequence of games:
+
+\begin{enumerate}[leftmargin=*]
+  \item Game 0 is the real \Project{} encryption output.
+  \item Game 1 replaces each HKDF-derived slot key with an independent random 256-bit key. Assumptions 3 and 4 make this change indistinguishable to an attacker without the signatures.
+  \item Game 2 replaces each encrypted master key with an encryption of zeros under the random slot key. AES-GCM confidentiality makes this indistinguishable.
+  \item Game 3 replaces the data ciphertext with an encryption of zeros under the random master key. AES-GCM confidentiality makes this indistinguishable.
+\end{enumerate}
+
+In Game 3 the blob contains no information about the plaintext. Therefore the real blob in Game 0 leaks no computationally useful information about the plaintext beyond length and public metadata.
+
+\section{Why agent availability matters}
+
+The file is readable while a matching agent is reachable because the agent can be asked to sign the stored challenge. The file becomes unreadable to anyone who has only the stored blob after that signing capability is unavailable. In local use, this can happen when the key is not loaded into the agent or the agent is stopped. In remote use, this can happen when logout removes the forwarded socket from the remote host. At that point, the stored blob contains only:
+
+\begin{itemize}[leftmargin=*]
+  \item public fingerprints;
+  \item public challenges;
+  \item public nonces;
+  \item AES-GCM ciphertexts and tags.
+\end{itemize}
+
+None of those values is enough to compute the slot key. The missing value is the agent signature over the stored challenge. Removing access to the matching SSH agent removes the ability to obtain that value.
+
+\section{Compatibility boundary: deterministic signatures}
+
+The current design derives key material from the exact signature bytes returned by the agent. This has an important consequence:
+
+\begin{quote}
+The same key, signing the same stored challenge, must return the same byte string during decryption that it returned during encryption.
+\end{quote}
+
+This property holds for Ed25519 as specified by EdDSA, which does not require a unique random number for each signature~\cite{rfc8032}. It also holds for the OpenSSH RSA/SHA2 path exercised by this project, where the code requests the \texttt{rsa-sha2-256} signature flag. It does not hold for conventional randomized ECDSA signatures.
+
+The local verification performed while preparing this paper found:
+
+\begin{longtable}{p{0.25\linewidth}p{0.22\linewidth}p{0.43\linewidth}}
+\toprule
+Key type & CLI round trip & Interpretation \\
+\midrule
+\endhead
+Ed25519 & Succeeded & Fits the correctness theorem. \\
+RSA 3072 & Succeeded & Fits the correctness theorem in the tested OpenSSH/Ruby environment. \\
+ECDSA P-256 & Failed & The decryption path could not recover a matching slot key; this is consistent with randomized ECDSA signatures. \\
+\bottomrule
+\end{longtable}
+
+Therefore, the project can accurately claim the proved property for deterministic-signature SSH keys. To claim support for every SSH key listed by \texttt{ssh-agent}, the implementation would need to change. The most direct hardening is to reject key types that are not known to produce stable signature bytes, or to use a different construction that does not depend on signature byte reproducibility.
+
+\section{Integrity and corruption behavior}
+
+AES-GCM provides both confidentiality and authentication. \Project{} relies on this twice:
+
+\begin{itemize}[leftmargin=*]
+  \item slot decryption authenticates the encrypted master key;
+  \item data decryption authenticates the encrypted file content.
+\end{itemize}
+
+The implementation's \texttt{Crypto.decrypt} method rejects too-short ciphertexts and converts OpenSSL GCM tag failures into \texttt{DecryptionError}:
+
+\begin{lstlisting}[style=rubycode,caption={Authentication failure handling from lib/ssh\_tresor/crypto.rb.}]
+def decrypt(key, nonce, ciphertext_with_tag)
+  raise DecryptionError, "ciphertext too short" if ciphertext_with_tag.bytesize < AUTH_TAG_SIZE
+
+  ciphertext = ciphertext_with_tag.byteslice(0, ciphertext_with_tag.bytesize - AUTH_TAG_SIZE)
+  tag = ciphertext_with_tag.byteslice(-AUTH_TAG_SIZE, AUTH_TAG_SIZE)
+
+  cipher = OpenSSL::Cipher.new("aes-256-gcm")
+  cipher.decrypt
+  cipher.key = key
+  cipher.iv = nonce
+  cipher.auth_tag = tag
+  cipher.auth_data = "".b
+
+  cipher.update(ciphertext) + cipher.final
+rescue OpenSSL::Cipher::CipherError
+  raise DecryptionError, "authentication failed - wrong key or corrupted data"
+end
+\end{lstlisting}
+
+This means that tampering with an encrypted key slot, data ciphertext, nonce, or tag causes decryption failure rather than silent plaintext corruption. The current code uses empty associated data, so public header fields are not separately authenticated as AAD; tampering with them can still cause parsing failure, slot selection failure, or authentication failure.
+
+\section{Nonce and randomness analysis}
+
+GCM requires nonce uniqueness under a fixed key. \Project{} uses 96-bit random nonces:
+
+\begin{lstlisting}[style=rubycode,caption={Random sizes from lib/ssh\_tresor/crypto.rb.}]
+CHALLENGE_SIZE = 32
+MASTER_KEY_SIZE = 32
+NONCE_SIZE = 12
+AUTH_TAG_SIZE = 16
+
+def random_challenge
+  SecureRandom.random_bytes(CHALLENGE_SIZE)
+end
+
+def random_master_key
+  SecureRandom.random_bytes(MASTER_KEY_SIZE)
+end
+
+def random_nonce
+  SecureRandom.random_bytes(NONCE_SIZE)
+end
+\end{lstlisting}
+
+The construction uses a fresh master key for each newly encrypted file and a fresh slot challenge for each key slot. Therefore nonce collision risk under the same AES-GCM key is already structurally low:
+
+\begin{itemize}[leftmargin=*]
+  \item the data key $K_M$ is fresh per new encryption;
+  \item each slot key $K_i$ is derived from a fresh challenge signature;
+  \item adding a key creates a new slot key and does not re-encrypt file data.
+\end{itemize}
+
+For a uniformly random 96-bit nonce space, the birthday collision probability after $q$ encryptions under one key is approximately $q(q-1)/2^{97}$. In normal \Project{} use, $q$ is effectively one per key for the data ciphertext and one per slot key for the wrapped master key.
+
+\section{Relation to encryption at rest}
+
+"Encryption at rest" usually means that data stored on persistent media is encrypted when not actively being processed. \Project{} satisfies that storage property for the output file: the storage medium receives only the \Tresor{} blob, not the plaintext. However, the phrase by itself does not capture the central security mechanism. A clearer description is:
+
+\begin{quote}
+\Project{} provides SSH-agent-mediated encryption at rest: files are stored encrypted, and decryption requires a live SSH agent with a matching private key operation.
+\end{quote}
+
+For the user story, an even more operational phrase is:
+
+\begin{quote}
+\Project{} provides SSH-agent-gated decryption: the stored file can be decrypted only while a matching private-key operation is reachable through \texttt{SSH\_AUTH\_SOCK}, whether the agent is local or forwarded.
+\end{quote}
+
+Both phrases are technically accurate. The first connects to the common storage-security category; the second explains the operational gate that makes the file unreadable when the matching agent capability is no longer reachable.
+
+\section{Evidence from the repository}
+
+The test suite exercises the core properties:
+
+\begin{itemize}[leftmargin=*]
+  \item AES-256-GCM encrypt/decrypt succeeds and wrong-key decryption fails;
+  \item binary and armored \Tresor{} formats round trip;
+  \item the public \texttt{Vault} API encrypts, decrypts, and lists slots;
+  \item CLI integration starts an SSH agent, creates Ed25519 keys, encrypts, decrypts, adds a key slot, removes a key slot, and confirms the remaining slot decrypts.
+\end{itemize}
+
+The verification run performed for this paper completed successfully:
+
+\begin{lstlisting}[style=textcode]
+bundle exec rspec
+10 examples, 0 failures
+\end{lstlisting}
+
+Additional key-type probing performed for this paper found successful round trips for Ed25519 and RSA, and a failed round trip for ECDSA. That result is not a failure of AES-GCM or HKDF; it is a consequence of deriving persistent key material from signature bytes when the signature scheme is randomized.
+
+\section{Recommendations and Future Improvements}
+
+The construction is sound for deterministic agent signatures under the stated threat model. The remaining recommendations focus on compatibility-conscious hardening and future format evolution:
+
+\begin{enumerate}[leftmargin=*]
+  \item Reject unsupported randomized key types during encryption, preferably before writing a file. A conservative initial allowlist would include \texttt{ssh-ed25519} and \texttt{ssh-rsa} with RSA/SHA2 signatures.
+  \item Deferred for compatibility: domain-separating the signed challenge would make the signature purpose explicit, but it would change the bytes sent to the SSH agent and therefore break compatibility with the existing Rust \texttt{ssh-tresor} format. This should only be reconsidered as part of a coordinated format-version change across implementations.
+  \item Consider authenticating selected public header fields as AES-GCM associated data in a future format version. The current format remains safe for plaintext confidentiality, but AAD would tighten whole-blob integrity semantics.
+\end{enumerate}
+
+\section{Conclusion}
+
+\Project{} implements a compact and defensible construction for SSH-agent-gated file encryption. It encrypts file contents with a fresh random master key, protects that master key with AES-GCM key slots derived from live SSH-agent signatures, and stores only public challenges, public fingerprints, nonces, and ciphertexts. Under standard assumptions for SecureRandom, HKDF-SHA256, AES-256-GCM, and deterministic SSH agent signatures, the mathematical argument is straightforward: after the matching agent signing capability disappears, an attacker with only the stored blob cannot recreate the slot key, cannot unwrap the master key, and cannot decrypt the file.
+
+The accurate claim is therefore:
+
+\begin{quote}
+\Project{} provides SSH-agent-mediated encryption at rest for deterministic-signature SSH keys. Files remain unreadable without a matching SSH-agent signing capability, whether the intended workflow uses a local agent loaded by \texttt{ssh-add} or a forwarded agent exposed through an SSH session. Decryption becomes possible again only when that matching agent capability is made available. This claim excludes compromise of an active encryption or decryption session, where plaintext, signature bytes, or derived keys could be recorded.
+\end{quote}
+
+\section*{Acknowledgments}
+
+The author thanks Harald Hoyer for publishing the original Rust implementation of \texttt{ssh-tresor}, available at \url{https://github.com/haraldh/ssh-tresor}. That project established the practical SSH-agent-based encryption pattern that inspired this Ruby implementation. The author also acknowledges OpenAI Codex for assistance in drafting, editing, and typesetting this paper.
+
+\begin{thebibliography}{9}
+
+\bibitem{nist-gcm}
+Morris J. Dworkin.
+\newblock \emph{Recommendation for Block Cipher Modes of Operation: Galois/Counter Mode (GCM) and GMAC}.
+\newblock NIST Special Publication 800-38D, 2007.
+\newblock \url{https://www.nist.gov/publications/recommendation-block-cipher-modes-operation-galoiscounter-mode-gcm-and-gmac}
+
+\bibitem{rfc5869}
+Hugo Krawczyk and Pasi Eronen.
+\newblock \emph{HMAC-based Extract-and-Expand Key Derivation Function (HKDF)}.
+\newblock RFC 5869, May 2010.
+\newblock \url{https://www.rfc-editor.org/rfc/rfc5869}
+
+\bibitem{ssh-agent-draft}
+Damien Miller.
+\newblock \emph{SSH Agent Protocol}.
+\newblock IETF Internet-Draft \texttt{draft-ietf-sshm-ssh-agent-16}, February 2026.
+\newblock \url{https://datatracker.ietf.org/doc/draft-ietf-sshm-ssh-agent/16/}
+
+\bibitem{rfc8332}
+Denis Bider.
+\newblock \emph{Use of RSA Keys with SHA-256 and SHA-512 in the Secure Shell (SSH) Protocol}.
+\newblock RFC 8332, March 2018.
+\newblock \url{https://www.rfc-editor.org/rfc/rfc8332}
+
+\bibitem{rfc8032}
+Simon Josefsson and Ilari Liusvaara.
+\newblock \emph{Edwards-Curve Digital Signature Algorithm (EdDSA)}.
+\newblock RFC 8032, January 2017.
+\newblock \url{https://www.rfc-editor.org/rfc/rfc8032}
+
+\bibitem{ruby-openssl-kdf}
+Ruby Documentation.
+\newblock \emph{OpenSSL::KDF}.
+\newblock \url{https://docs.ruby-lang.org/en/4.0/OpenSSL/KDF.html}
+
+\bibitem{ruby-openssl-cipher}
+Ruby Documentation.
+\newblock \emph{OpenSSL::Cipher}.
+\newblock \url{https://docs.ruby-lang.org/en/4.0/OpenSSL/Cipher.html}
+
+\end{thebibliography}
+
+\end{document}
