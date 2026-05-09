@@ -4,12 +4,14 @@ require_relative "format"
 require_relative "tresor"
 
 module SshTresor
-  # Public high-level API for encrypting and decrypting tresors from another Ruby
-  # application or gem.
+  # Public high-level API for SSH-agent-mediated encryption at rest from another
+  # Ruby application or gem.
   #
   # `Vault` is intentionally a small facade over the lower-level SSH agent,
   # crypto, and wire-format objects. It connects to `SSH_AUTH_SOCK` by default,
-  # but accepts an injected agent object for tests or alternate transports.
+  # but accepts an injected agent object for tests or alternate transports. The
+  # live capability required to decrypt is agent signing for a stored challenge,
+  # not possession of the public key or fingerprint alone.
   #
   # @example Encrypt and decrypt using the current SSH agent
   #   vault = SshTresor::Vault.new
@@ -35,7 +37,7 @@ module SshTresor
       @agent = agent
     end
 
-    # Encrypts plaintext for one or more keys available in the SSH agent.
+    # Encrypts plaintext for one or more signing keys available in the SSH agent.
     #
     # When no fingerprints are given, the first key returned by the agent is
     # used. Fingerprints may be full `SHA256:...` values or unambiguous prefixes.
@@ -51,7 +53,7 @@ module SshTresor
       armor ? blob.to_armored : blob.to_bytes
     end
 
-    # Decrypts an encrypted tresor using any matching key in the SSH agent.
+    # Decrypts an encrypted tresor using any matching signing key in the SSH agent.
     #
     # The input may be binary `SSHTRESR` v3 data or armored text. The agent is
     # asked to sign the stored slot challenge for matching key fingerprints.

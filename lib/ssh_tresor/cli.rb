@@ -48,9 +48,12 @@ module SshTresor
       io.puts <<~HELP
         Usage: ssh-tresor <command> [options]
 
+        Provides SSH-agent-mediated encryption at rest. Decryption requires a
+        live SSH agent signing capability, not merely the public key.
+
         Commands:
-          encrypt       Encrypt data using SSH keys from the agent
-          decrypt       Decrypt data using an SSH key from the agent
+          encrypt       Encrypt data using SSH agent signing
+          decrypt       Decrypt data using SSH agent signing
           add-key       Add a key to an existing tresor
           remove-key    Remove a key from an existing tresor
           list-slots    List key slots in a tresor

@@ -6,8 +6,8 @@ Gem::Specification.new do |spec|
   spec.name = "ssh-tresor"
   spec.version = SshTresor::VERSION
   spec.authors = ["Ronan Potage"]
-  spec.summary = "Encrypt and decrypt secrets using SSH agent keys"
-  spec.description = "Independent Ruby implementation of ssh-tresor using ssh-agent signatures, HKDF-SHA256, and AES-256-GCM."
+  spec.summary = "SSH-agent-mediated encryption at rest for secrets"
+  spec.description = "Independent Ruby implementation of ssh-tresor using live ssh-agent signatures, HKDF-SHA256, and AES-256-GCM."
   spec.homepage = "https://github.com/capripot/ssh-tresor-ruby"
   spec.license = "MIT"
   spec.required_ruby_version = ">= 3.1"

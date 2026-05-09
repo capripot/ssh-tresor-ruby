@@ -1,13 +1,19 @@
 # ssh-tresor-ruby
 
-`ssh-tresor` encrypts and decrypts secrets using keys available through
-`ssh-agent`.
+`ssh-tresor` provides SSH-agent-mediated encryption at rest: secrets are
+stored encrypted on disk and can be decrypted only while a matching SSH agent
+signing capability is available.
 
 The private key never leaves the SSH agent. Encryption creates a random master
 key, asks the agent to sign random per-key challenges, derives slot keys with
 HKDF-SHA256, and stores an AES-256-GCM encrypted master key slot for each SSH
 key. Decryption works when one matching SSH key is loaded locally or forwarded
 with `ssh -A`.
+
+The live capability is agent signing, not possession of the public key. Public
+key fingerprints are stored in the tresor metadata so the right slot can be
+found, but the file cannot be unlocked unless the agent can sign the stored
+challenge for that slot.
 
 It is freely inspired by the [`ssh-tresor`][1] project but doesn't depend
 on it.

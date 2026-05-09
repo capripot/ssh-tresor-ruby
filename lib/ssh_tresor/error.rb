@@ -30,7 +30,9 @@ module SshTresor
   class NoMatchingSlot < Error
     def initialize
       super(
-        "No matching slot found\nHint: None of the keys in your SSH agent can decrypt this tresor",
+        "No matching slot found\n" \
+        "Hint: Decryption requires a matching SSH agent signing capability, " \
+        "not just the public key",
         exit_code: EXIT_KEY_NOT_FOUND
       )
     end
@@ -42,4 +44,3 @@ module SshTresor
     end
   end
 end
-
