@@ -14,7 +14,7 @@ module SshTresor
 
   class TresorBlob
     MAGIC = "SSHTRESR".b
-    VERSION = 0x03
+    VERSION = 0x01
     FINGERPRINT_SIZE = 32
     CHALLENGE_SIZE = 32
     NONCE_SIZE = 12
@@ -27,7 +27,7 @@ module SshTresor
     ARMOR_BEGIN = "-----BEGIN SSH TRESOR-----"
     ARMOR_END = "-----END SSH TRESOR-----"
 
-    attr_reader :slots, :data_nonce, :ciphertext
+    attr_reader :version, :slots, :data_nonce, :ciphertext
 
     def self.from_bytes(data)
       bytes = data.b
@@ -73,7 +73,7 @@ module SshTresor
       data_nonce = data.byteslice(slots_end, NONCE_SIZE)
       ciphertext = data.byteslice(slots_end + NONCE_SIZE, data.bytesize - slots_end - NONCE_SIZE)
 
-      new(slots: slots, data_nonce: data_nonce, ciphertext: ciphertext)
+      new(version: version, slots: slots, data_nonce: data_nonce, ciphertext: ciphertext)
     end
 
     def self.parse_slot(bytes)
@@ -96,7 +96,10 @@ module SshTresor
       )
     end
 
-    def initialize(slots:, data_nonce:, ciphertext:)
+    def initialize(slots:, data_nonce:, ciphertext:, version: VERSION)
+      raise Error, "Invalid tresor format: unsupported version: #{version}, expected #{VERSION}" unless version == VERSION
+
+      @version = version
       @slots = slots
       @data_nonce = data_nonce
       @ciphertext = ciphertext
@@ -106,7 +109,7 @@ module SshTresor
       raise Error, "Invalid tresor format: tresor has no key slots" if slots.empty?
       raise Error, "Invalid tresor format: tresor has too many slots (max 255)" if slots.length > 255
 
-      MAGIC + [VERSION, slots.length].pack("CC") + slots.map(&:to_bytes).join.b + data_nonce + ciphertext
+      MAGIC + [version, slots.length].pack("CC") + slots.map(&:to_bytes).join.b + data_nonce + ciphertext
     end
 
     def to_armored
@@ -124,4 +127,3 @@ module SshTresor
     end
   end
 end
-

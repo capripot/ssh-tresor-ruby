@@ -11,6 +11,8 @@ module SshTresor
     MASTER_KEY_SIZE = 32
     NONCE_SIZE = 12
     AUTH_TAG_SIZE = 16
+    KDF_SALT = "ssh-tresor-ruby-v1".b
+    SIGNING_DOMAIN = "ssh-tresor-ruby-v1 slot-key-derivation".b
 
     module_function
 
@@ -26,10 +28,14 @@ module SshTresor
       SecureRandom.random_bytes(NONCE_SIZE)
     end
 
+    def slot_signing_payload(challenge)
+      SIGNING_DOMAIN + "\0".b + challenge.b
+    end
+
     def derive_key(signature)
       OpenSSL::KDF.hkdf(
         signature,
-        salt: "ssh-tresor-v3",
+        salt: KDF_SALT,
         info: "slot-key-derivation",
         length: 32,
         hash: "SHA256"
@@ -68,4 +74,3 @@ module SshTresor
     end
   end
 end
-

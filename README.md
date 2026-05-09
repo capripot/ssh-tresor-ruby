@@ -69,7 +69,7 @@ remain available if you need direct access to parsed slots.
 
 ## Wire Format
 
-The implementation writes and reads the `SSHTRESR` v3 format:
+The implementation writes and reads the `SSHTRESR` v1 format:
 
 ```text
 Header:  SSHTRESR (8) + version (1) + slot_count (1)

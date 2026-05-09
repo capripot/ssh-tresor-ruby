@@ -19,6 +19,17 @@ RSpec.describe "crypto and format" do
     end.to raise_error(SshTresor::DecryptionError)
   end
 
+  it "domain-separates SSH agent signing payloads" do
+    challenge = "c" * SshTresor::Crypto::CHALLENGE_SIZE
+    payload = SshTresor::Crypto.slot_signing_payload(challenge)
+
+    expect(payload).to eq(SshTresor::Crypto::SIGNING_DOMAIN + "\0".b + challenge.b)
+  end
+
+  it "uses the ruby v1 namespace for key derivation" do
+    expect(SshTresor::Crypto::KDF_SALT).to eq("ssh-tresor-ruby-v1")
+  end
+
   it "round-trips the binary tresor format" do
     slot = SshTresor::Slot.new(
       fingerprint: "f" * 32,
@@ -34,10 +45,31 @@ RSpec.describe "crypto and format" do
 
     parsed = SshTresor::TresorBlob.from_bytes(blob.to_bytes)
 
+    expect(parsed.version).to eq(SshTresor::TresorBlob::VERSION)
     expect(parsed.slots.length).to eq(1)
     expect(parsed.slots.first.fingerprint).to eq(slot.fingerprint)
     expect(parsed.data_nonce).to eq(blob.data_nonce)
     expect(parsed.ciphertext).to eq(blob.ciphertext)
+  end
+
+  it "rejects legacy v3 tresor format" do
+    slot = SshTresor::Slot.new(
+      fingerprint: "f" * 32,
+      challenge: "c" * 32,
+      nonce: "n" * 12,
+      encrypted_key: "e" * 48
+    )
+    blob = SshTresor::TresorBlob.new(
+      slots: [slot],
+      data_nonce: "d" * 12,
+      ciphertext: "payload" + ("t" * 16)
+    )
+    legacy_bytes = blob.to_bytes
+    legacy_bytes.setbyte(8, 0x03)
+
+    expect do
+      SshTresor::TresorBlob.from_bytes(legacy_bytes)
+    end.to raise_error(SshTresor::Error, /unsupported version: 3, expected 1/)
   end
 
   it "round-trips the armored tresor format" do
@@ -58,4 +90,3 @@ RSpec.describe "crypto and format" do
     expect(parsed.to_bytes).to eq(blob.to_bytes)
   end
 end
-

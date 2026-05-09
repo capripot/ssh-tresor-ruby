@@ -4,11 +4,12 @@ RSpec.describe SshTresor::Vault do
   FakeKey = Struct.new(:fingerprint_bytes, :security_key?, keyword_init: true)
 
   class FakeAgent
-    attr_reader :keys
+    attr_reader :keys, :signed_data
 
     def initialize(keys)
       @keys = keys
       @signatures = {}
+      @signed_data = []
     end
 
     def first_key
@@ -27,6 +28,7 @@ RSpec.describe SshTresor::Vault do
     end
 
     def sign(key, challenge)
+      signed_data << challenge
       @signatures[[key.fingerprint_bytes, challenge]] ||= Digest::SHA256.digest(key.fingerprint_bytes + challenge)
     end
   end
@@ -47,5 +49,15 @@ RSpec.describe SshTresor::Vault do
 
     expect(vault.list_slots(encrypted)).to eq([key.fingerprint_bytes])
   end
-end
 
+  it "signs domain-separated slot challenges for new tresors" do
+    encrypted = vault.encrypt("secret")
+    blob = SshTresor::TresorBlob.from_bytes(encrypted)
+    slot = blob.slots.first
+
+    expect(blob.version).to eq(SshTresor::TresorBlob::VERSION)
+    expect(agent.signed_data).to include(SshTresor::Crypto.slot_signing_payload(slot.challenge))
+    expect(agent.signed_data).not_to include(slot.challenge)
+  end
+
+end

@@ -114,7 +114,7 @@ module SshTresor
 
     def create_slot(agent, key, master_key)
       challenge = Crypto.random_challenge
-      signature = agent.sign(key, challenge)
+      signature = sign_slot_challenge(agent, key, challenge)
       slot_key = Crypto.derive_key(signature)
       nonce = Crypto.random_nonce
       encrypted_key = Crypto.encrypt(slot_key, nonce, master_key)
@@ -128,9 +128,7 @@ module SshTresor
     end
 
     def decrypt_with_slot(agent, key, slot, blob)
-      signature = agent.sign(key, slot.challenge)
-      slot_key = Crypto.derive_key(signature)
-      master_key = Crypto.decrypt(slot_key, slot.nonce, slot.encrypted_key)
+      master_key = decrypt_slot_master_key(agent, key, slot)
       Crypto.decrypt(master_key, blob.data_nonce, blob.ciphertext)
     end
 
@@ -140,9 +138,7 @@ module SshTresor
         next if slot.nil?
 
         begin
-          signature = agent.sign(key, slot.challenge)
-          slot_key = Crypto.derive_key(signature)
-          return Crypto.decrypt(slot_key, slot.nonce, slot.encrypted_key)
+          return decrypt_slot_master_key(agent, key, slot)
         rescue DecryptionError
           next
         end
@@ -165,6 +161,16 @@ module SshTresor
       else
         raise KeyNotFound, "Key not found: #{fingerprint} (ambiguous: #{matches.length} slots match this prefix, please be more specific)"
       end
+    end
+
+    def sign_slot_challenge(agent, key, challenge)
+      agent.sign(key, Crypto.slot_signing_payload(challenge))
+    end
+
+    def decrypt_slot_master_key(agent, key, slot)
+      signature = agent.sign(key, Crypto.slot_signing_payload(slot.challenge))
+      slot_key = Crypto.derive_key(signature)
+      Crypto.decrypt(slot_key, slot.nonce, slot.encrypted_key)
     end
   end
 end

@@ -55,7 +55,7 @@ module SshTresor
 
     # Decrypts an encrypted tresor using any matching signing key in the SSH agent.
     #
-    # The input may be binary `SSHTRESR` v3 data or armored text. The agent is
+    # The input may be binary `SSHTRESR` data or armored text. The agent is
     # asked to sign the stored slot challenge for matching key fingerprints.
     #
     # @param encrypted [String] Binary or armored tresor content.
