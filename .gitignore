@@ -1,6 +1,8 @@
 /.bundle/
 /coverage/
+/doc/
 /pkg/
+/_site/
 /tmp/
 *.gem
 .yardoc

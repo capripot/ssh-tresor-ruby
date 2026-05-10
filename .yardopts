@@ -1,0 +1,9 @@
+--title ssh-tresor-ruby
+--readme README.md
+--markup markdown
+--no-private
+lib/*.rb
+lib/**/*.rb
+-
+README.md
+LICENSE.txt

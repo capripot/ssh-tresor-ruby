@@ -6,11 +6,21 @@ require "optparse"
 require_relative "../ssh_tresor"
 
 module SshTresor
+  # Command-line interface for the `ssh-tresor` executable.
+  #
+  # This class is intentionally small and delegates cryptographic operations to
+  # {SshTresor::Tresor}. Library callers should use {SshTresor::Vault} instead.
+  #
+  # @api private
   class CLI
+    # @param argv [Array<String>] command-line arguments excluding executable name.
     def initialize(argv)
       @argv = argv.dup
     end
 
+    # Dispatches the requested CLI command.
+    #
+    # @return [Integer] process exit code.
     def run
       command = @argv.shift
       return help if command.nil? || %w[-h --help help].include?(command)
